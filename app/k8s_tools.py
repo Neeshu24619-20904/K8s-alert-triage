@@ -4,9 +4,11 @@ from app.config import settings
 
 
 def _load_core_and_apps() -> tuple[client.CoreV1Api, client.AppsV1Api]:
-    config.load_kube_config(context=settings.kube_context)
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        config.load_kube_config(context=settings.kube_context)
     return client.CoreV1Api(), client.AppsV1Api()
-
 
 def get_pod_diagnostics(namespace: str, pod_name: str) -> dict:
     """Read-only diagnostics: pod status, container states, events, and tail logs."""

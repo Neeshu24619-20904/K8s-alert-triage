@@ -1,36 +1,53 @@
 from datetime import datetime, timezone
+from uuid import uuid4
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from app.config import settings
-from app.db import append_audit_event, get_action, update_action_decision
+
+PENDING_ACTIONS: dict[str, dict] = {}
+AUDIT_LOG: list[dict] = []
+
+
+def queue_remediation(namespace: str, deployment: str, action_type: str, reason: str) -> dict:
+    action_id = str(uuid4())[:8]
+    record = {
+        "action_id": action_id,
+        "status": "pending_approval",
+        "namespace": namespace,
+        "deployment": deployment,
+        "action_type": action_type,
+        "reason": reason,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    PENDING_ACTIONS[action_id] = record
+    return record
 
 
 def execute_approved_action(action_id: str, approved: bool) -> dict:
-    record = get_action(action_id)
-    if not record:
+    if action_id not in PENDING_ACTIONS:
         return {"error": f"Unknown action_id: {action_id}"}
 
-    if record["status"] != "pending_approval":
-        return {"error": f"Action {action_id} is already finalized with status '{record['status']}'"}
-
+    record = PENDING_ACTIONS.pop(action_id)
     now = datetime.now(timezone.utc).isoformat()
 
     if not approved:
-        updated = update_action_decision(action_id, "rejected", "Rejected by operator", now)
-        append_audit_event({"event": "action_rejected", "action": updated})
-        return updated or {}
+        record["status"] = "rejected"
+        record["decided_at"] = now
+        AUDIT_LOG.append(record)
+        return record
 
     if settings.dry_run_remediation:
-        detail = f"[DRY_RUN] Would patch {record['namespace']}/{record['deployment']} restartedAt={now}"
-        updated = update_action_decision(action_id, "executed_dry_run", detail, now)
-        append_audit_event({"event": "action_executed_dry_run", "action": updated})
-        return updated or {}
+        record["status"] = "executed_dry_run"
+        record["detail"] = (
+            f"[DRY_RUN] Would patch {record['namespace']}/{record['deployment']} "
+            f"restartedAt={now}"
+        )
+        record["decided_at"] = now
+        AUDIT_LOG.append(record)
+        return record
 
     try:
-        try:
-            config.load_incluster_config()
-        except config.ConfigException:
-            config.load_kube_config(context=settings.kube_context)
+        config.load_kube_config(context=settings.kube_context)
         apps_v1 = client.AppsV1Api()
         patch_body = {
             "spec": {
@@ -48,12 +65,12 @@ def execute_approved_action(action_id: str, approved: bool) -> dict:
             namespace=record["namespace"],
             body=patch_body,
         )
-        status = "executed"
-        detail = f"Triggered rollout restart on {record['namespace']}/{record['deployment']}"
+        record["status"] = "executed"
+        record["detail"] = f"Triggered rollout restart on {record['namespace']}/{record['deployment']}"
     except ApiException as exc:
-        status = "failed"
-        detail = f"Kubernetes API error {exc.status}: {exc.reason}"
+        record["status"] = "failed"
+        record["detail"] = f"Kubernetes API error {exc.status}: {exc.reason}"
 
-    updated = update_action_decision(action_id, status, detail, now)
-    append_audit_event({"event": "action_decided", "action": updated})
-    return updated or {}
+    record["decided_at"] = now
+    AUDIT_LOG.append(record)
+    return record

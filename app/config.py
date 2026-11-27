@@ -12,8 +12,6 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     dry_run_remediation: bool = True
-    git_repo_path: str = "."
-    webhook_notify_url: str = ""
 
 
 settings = Settings()
